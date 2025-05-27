@@ -1,4 +1,4 @@
-# Gemini API Proxy Server
+# Gemini Proxy Rotation API
 
 A robust FastAPI-based proxy server for managing multiple Google Gemini API keys with automatic failover, rate limit handling, and encrypted request processing.
 
