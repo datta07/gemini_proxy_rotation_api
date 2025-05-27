@@ -1,0 +1,5 @@
+fastapi
+uvicorn
+pycryptodome
+requests
+openai
