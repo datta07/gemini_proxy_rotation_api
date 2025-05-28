@@ -2,4 +2,4 @@ fastapi
 uvicorn
 pycryptodome
 requests
-google-generativeai
+google-genai
