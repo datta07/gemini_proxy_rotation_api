@@ -9,9 +9,9 @@ from typing import Dict, List, Any
 from datetime import datetime, timedelta
 import asyncio # For async locks
 
-# Import the OpenAI library (which works for Google Gemini as shown in your example)
-from openai import OpenAI
-from openai import APIError, RateLimitError, AuthenticationError # Specific OpenAI errors
+# Import Google GenAI specific types
+from google import genai
+from google.genai import types
 
 app = FastAPI()
 
@@ -54,7 +54,8 @@ except Exception as e:
 
 # The target model and base URL for all these Gemini keys
 GEMINI_MODEL_NAME = os.environ.get('GEMINI_MODEL_NAME', 'gemini-2.5-flash-preview-05-20')
-GEMINI_BASE_URL = os.environ.get('GEMINI_BASE_URL', 'https://generativelanguage.googleapis.com/v1beta')
+# GEMINI_BASE_URL is not directly used by genai.Client; it's handled by setting api_key
+# The wrapper will manage passing the key.
 
 # --- In-Memory API Key State Management (NEW) ---
 # This dictionary will hold the state of each API key
@@ -75,6 +76,146 @@ for key in _api_key_list:
         'cooldown_until': None
     }
 print(f"Initialized API key states for {len(API_KEYS)} keys.")
+
+# --- GeminiOpenAIWrapper Integration ---
+class GeminiOpenAIWrapper:
+    def __init__(self, api_key: str):
+        self.client = genai.Client(api_key=api_key)
+        # We don't need model_mapping here as the parent service will dictate GEMINI_MODEL_NAME
+        # self.model_mapping = {
+        #     "gpt-4": "gemini-2.5-flash-preview-05-20", 
+        #     "gpt-3.5-turbo": "gemini-1.5-flash-preview-05-20", 
+        # }
+        # self.default_model = "gemini-2.5-flash-preview-05-20" # Not strictly needed with fixed GEMINI_MODEL_NAME
+
+    def _convert_openai_to_gemini_content(self, messages: List[Dict[str, str]]):
+        """Converts OpenAI-style messages to Gemini-style content."""
+        gemini_contents = []
+        for message in messages:
+            role = "user" if message["role"] == "user" else "model"
+            if message["role"] == "system":
+                # System instructions are handled separately in Gemini's API
+                continue 
+            
+            parts = [types.Part.from_text(text=message["content"])]
+            gemini_contents.append(types.Content(role=role, parts=parts))
+        return gemini_contents
+
+    def _extract_system_instruction(self, messages: List[Dict[str, str]]):
+        """Extracts system instructions from OpenAI-style messages."""
+        system_instructions = []
+        for message in messages:
+            if message["role"] == "system"]:
+                system_instructions.append(types.Part.from_text(text=message["content"]))
+        return system_instructions
+
+    async def chat_completions(self, payload: Dict[str, Any]):
+        """
+        Mimics OpenAI's chat completions API.
+
+        Args:
+            payload (dict): A dictionary representing the OpenAI chat completions request.
+                            Expected keys: 'model', 'messages', 'temperature', 'top_p', 'max_tokens'.
+
+        Returns:
+            dict: A dictionary mimicking OpenAI's chat completions response format.
+        """
+        model_name = payload.get("model", GEMINI_MODEL_NAME) # Use the global GEMINI_MODEL_NAME
+        messages = payload.get("messages", [])
+        temperature = payload.get("temperature", 0.7) 
+        top_p = payload.get("top_p", 0.95) # Gemini's default top_p
+        max_tokens = payload.get("max_tokens") # Optional, let Gemini default if not set
+
+        gemini_contents = self._convert_openai_to_gemini_content(messages)
+        system_instructions = self._extract_system_instruction(messages)
+
+        generate_content_config = types.GenerateContentConfig(
+            temperature=temperature,
+            top_p=top_p,
+            response_mime_type="text/plain",
+            thinking_config=types.ThinkingConfig(thinking_budget=0),
+        )
+        
+        if max_tokens is not None:
+            generate_content_config.max_output_tokens = max_tokens
+        
+        if system_instructions:
+            # system_instruction expects a list of Parts, not a single string if multiple
+            # If your system instruction is always a single string, this is fine.
+            # If multiple system messages can be present, you might need to combine them.
+            generate_content_config.system_instruction = system_instructions
+            
+        # Handle cases where there are no user/model messages, only system instructions
+        if not gemini_contents and not system_instructions:
+             raise ValueError("No valid user messages or system instructions found in payload.")
+        
+        try:
+            # The client.models.generate_content is not an async function in google-genai,
+            # so we run it in a thread pool executor to prevent blocking the event loop.
+            # However, the wrapper itself is awaited in the FastAPI endpoint, making it
+            # appear asynchronous from the outside.
+            response = await asyncio.to_thread(
+                self.client.models.generate_content,
+                model=model_name, # Use the actual model name passed/defaulted
+                contents=gemini_contents,
+                config=generate_content_config
+            )
+
+            # Construct OpenAI-like response
+            openai_response = {
+                "id": f"chatcmpl-wrapper-{os.urandom(8).hex()}",
+                "object": "chat.completion",
+                "created": int(datetime.now().timestamp()), # Use current timestamp
+                "model": model_name,
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {"role": "assistant", "content": response.text},
+                        "finish_reason": "stop" # Gemini doesn't always provide explicit finish_reason like OpenAI
+                    }
+                ],
+                "usage": {
+                    "prompt_tokens": response.usage_metadata.prompt_token_count,
+                    "completion_tokens": response.usage_metadata.candidates_token_count,
+                    "total_tokens": response.usage_metadata.total_token_count
+                }
+            }
+            return openai_response
+
+        except genai.types.rpc.Code as rpc_code:
+            # Handle specific Gemini RPC errors (e.g., RESOURCE_EXHAUSTED for rate limits)
+            # This is where we map Gemini errors to OpenAI-like exceptions or custom ones
+            error_message = f"Gemini RPC Error ({rpc_code.value}): {rpc_code.name}"
+            print(f"RPC Error: {error_message}")
+            if rpc_code == genai.types.rpc.Code.RESOURCE_EXHAUSTED:
+                # This typically means rate limit or quota exceeded
+                raise GeminiRateLimitError(error_message)
+            elif rpc_code == genai.types.rpc.Code.UNAUTHENTICATED:
+                # API Key invalid
+                raise GeminiAuthenticationError(error_message)
+            elif rpc_code == genai.types.rpc.Code.INVALID_ARGUMENT:
+                # Malformed request, e.g. invalid content format
+                raise GeminiAPIError(status_code=400, message=error_message)
+            else:
+                # Other generic API errors
+                raise GeminiAPIError(status_code=500, message=error_message)
+        except Exception as e:
+            # Catch all other exceptions from the genai library or underlying network
+            raise GeminiAPIError(status_code=500, message=f"Gemini API call failed: {str(e)}")
+
+# Define custom exceptions to mimic OpenAI's for consistent handling
+class GeminiRateLimitError(Exception):
+    pass
+
+class GeminiAuthenticationError(Exception):
+    pass
+
+class GeminiAPIError(Exception):
+    def __init__(self, status_code: int, message: str):
+        self.status_code = status_code
+        self.message = message
+        super().__init__(f"API Error {status_code}: {message}")
+
 
 # --- Helper Functions ---
 
@@ -167,42 +308,40 @@ async def get_next_available_key() -> str:
 async def call_gemini_api(api_key: str, payload: List[Dict[str, str]]):
     """
     Calls the Google Gemini API using the selected API key.
-    Initializes a new OpenAI client for each call to ensure the correct API key is used.
+    Initializes a new GeminiOpenAIWrapper client for each call to ensure the correct API key is used.
     """
     try:
-        client = OpenAI(api_key=api_key, base_url=GEMINI_BASE_URL)
-        response = client.chat.completions.create(
-            model=GEMINI_MODEL_NAME,
-            messages=payload,
-            temperature=0.5,
-            top_p=0.1,
-            max_tokens=1000,
-        )
-        return response.model_dump_json() # Return JSON string
-    except RateLimitError as e:
-        # This key hit a rate limit, mark it and let the caller retry
-        await mark_key_rate_limited(api_key, f"Rate limit: {e.response}")
-        # Re-raise as an HTTPException to trigger the retry logic in the caller
+        # Create an instance of our wrapper for the current API key
+        gemini_wrapper = GeminiOpenAIWrapper(api_key=api_key)
+        
+        # Construct the payload for the wrapper's chat_completions method
+        wrapper_payload = {
+            "model": GEMINI_MODEL_NAME, # Use the globally defined model
+            "messages": payload, # Pass the original OpenAI-like messages
+            "temperature": 0.5, # As per original request
+            "top_p": 0.1,       # As per original request
+            "max_tokens": 1000  # As per original request
+        }
+
+        response_dict = await gemini_wrapper.chat_completions(wrapper_payload)
+        
+        # The wrapper already returns an OpenAI-like dictionary, so convert to JSON string
+        return json.dumps(response_dict) 
+
+    except GeminiRateLimitError as e:
+        await mark_key_rate_limited(api_key, f"Rate limit: {e.message}")
         raise HTTPException(status_code=429, detail=f"Rate limit for key ending ...{api_key[-4:]} exceeded. Retrying with another key.")
-    except AuthenticationError as e:
-        # This key is likely invalid or revoked. Mark it as rate-limited permanently (or with a very long cooldown)
-        # Or, you might want to remove it from the active pool entirely.
-        # For simplicity here, we'll mark it as rate-limited for a long time.
-        # Consider a separate mechanism for managing "permanently bad" keys.
-        await mark_key_rate_limited(api_key, f"Authentication error: {e.response}")
+    except GeminiAuthenticationError as e:
+        await mark_key_rate_limited(api_key, f"Authentication error: {e.message}")
         send_telegram_notification(f"CRITICAL: API Key ending ...{api_key[-4:]} failed authentication. Please check it.")
         raise HTTPException(status_code=401, detail=f"Authentication failed for key ending ...{api_key[-4:]}. Retrying with another key.")
-    except APIError as e:
-        # General API error (e.g., bad request, model not found, internal server error from Gemini)
-        error_message = f"Gemini API Error (status {e.status_code if hasattr(e, 'status_code') else 'unknown'}): {e.response}"
-        # If it's an error that suggests a problem with the key or service availability,
-        # you might choose to mark the key as rate-limited as a fallback.
-        # For typical 5xx errors, it might be a temporary service issue, not necessarily key-specific.
-        if e.status_code and e.status_code >= 500: # Example: internal server error from the model provider
-             await mark_key_rate_limited(api_key, f"Server error: {e.response}")
+    except GeminiAPIError as e:
+        error_message = f"Gemini API Error (status {e.status_code}): {e.message}"
+        if e.status_code >= 500: # Server-side errors or bad gateway
+             await mark_key_rate_limited(api_key, f"Server error: {e.message}")
              raise HTTPException(status_code=502, detail=f"Bad Gateway (upstream server error for key ending ...{api_key[-4:]}). Retrying with another key.")
         send_telegram_notification(f"Gemini API Error for key ending ...{api_key[-4:]}: {error_message}")
-        raise HTTPException(status_code=e.status_code if hasattr(e, 'status_code') else 500, detail=error_message)
+        raise HTTPException(status_code=e.status_code, detail=error_message)
     except Exception as e:
         send_telegram_notification(f"Unexpected error during Gemini API call for key ending ...{api_key[-4:]}: {e}")
         raise HTTPException(status_code=500, detail=f"An unexpected error occurred: {str(e)}")
@@ -211,13 +350,19 @@ async def call_gemini_api(api_key: str, payload: List[Dict[str, str]]):
 
 @app.post("/chat")
 async def chat_proxy(encrypted_data: str = Body(...)):
-    decrypted_data: dict
+    decrypted_data: Dict[str, Any] # Expecting the decrypted data to be the full OpenAI-like payload
     try:
         # Decrypt the incoming data
         decrypted_data = decrypt_data(encrypted_data)
 
-        if not isinstance(decrypted_data, list) or not all(isinstance(m, dict) for m in decrypted_data):
-            raise HTTPException(status_code=422, detail="Decrypted data must be a list of message dictionaries.")
+        # Validate structure of the decrypted payload (it should be an OpenAI-like request dict)
+        if not isinstance(decrypted_data, dict) or "messages" not in decrypted_data:
+            raise HTTPException(status_code=422, detail="Decrypted data must be an OpenAI-like request dictionary with 'messages'.")
+        
+        # The 'messages' key from the decrypted_data is what we pass to call_gemini_api
+        messages_payload = decrypted_data["messages"]
+        if not isinstance(messages_payload, list) or not all(isinstance(m, dict) for m in messages_payload):
+            raise HTTPException(status_code=422, detail="Messages in decrypted data must be a list of message dictionaries.")
 
         max_retries = len(API_KEYS) + 1 # Allow trying each key once plus one more global retry
         for attempt in range(max_retries):
@@ -225,8 +370,9 @@ async def chat_proxy(encrypted_data: str = Body(...)):
                 # Get the next available API key
                 current_api_key = await get_next_available_key()
 
-                # Call the Gemini API with the selected key and decrypted payload
-                response_json = await call_gemini_api(current_api_key, decrypted_data)
+                # Call the Gemini API wrapper with the selected key and the full decrypted payload
+                # The `call_gemini_api` now expects the full OpenAI-like payload
+                response_json = await call_gemini_api(current_api_key, messages_payload)
                 
                 # If successful, notify and return
                 send_telegram_notification(f"Successfully processed request using key ending ...{current_api_key[-4:]} for model {GEMINI_MODEL_NAME}.")
@@ -235,8 +381,8 @@ async def chat_proxy(encrypted_data: str = Body(...)):
             except HTTPException as e:
                 # If it's a 429 (rate limit) or 401 (auth error leading to retry)
                 # and we still have attempts left, continue to the next iteration
-                if e.status_code in [429, 401] and attempt < max_retries - 1:
-                    print(f"Attempt {attempt+1}/{max_retries} failed ({e.status_code}). Trying next key...")
+                if e.status_code in [429, 401, 502] and attempt < max_retries - 1: # Added 502 for upstream server errors
+                    print(f"Attempt {attempt+1}/{max_retries} failed ({e.status_code}, {e.detail}). Trying next key...")
                     # The `mark_key_rate_limited` is called within `call_gemini_api`,
                     # so we just need to loop to `get_next_available_key` again.
                     continue
@@ -265,4 +411,17 @@ async def chat_proxy(encrypted_data: str = Body(...)):
 # Example of how to run this (if not using uvicorn directly via command line)
 # if __name__ == "__main__":
 #     import uvicorn
+#     # Set dummy environment variables for local testing if not already set
+#     os.environ['AES_SECRET_KEY'] = 'a' * 32
+#     os.environ['AES_IV'] = 'b' * 16
+#     os.environ['GEMINI_API_KEYS'] = '{"YOUR_GEMINI_KEY_1": "Label1", "YOUR_GEMINI_KEY_2": "Label2"}'
+#     # You would typically get real API keys from environment variables
+#     # Ensure your actual Gemini API keys are set before running.
+#     # You can get a test key from https://ai.google.dev/
+#     # For this example, I'll put a placeholder. Replace with actual keys.
+#     if not os.environ['GEMINI_API_KEYS']:
+#          print("WARNING: GEMINI_API_KEYS not set. Please set it for local testing.")
+#          # Fallback for demonstration if not set
+#          os.environ['GEMINI_API_KEYS'] = json.dumps({"YOUR_ACTUAL_GEMINI_API_KEY_HERE": "DevTest"})
+#     
 #     uvicorn.run(app, host="0.0.0.0", port=8000)
