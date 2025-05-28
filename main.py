@@ -348,7 +348,7 @@ async def chat_proxy(encrypted_data: str = Body(...)):
                 # Pass the decrypted list of messages directly to call_gemini_api
                 response_json = await call_gemini_api(current_api_key, decrypted_messages)
                 
-                send_telegram_notification(f"Successfully processed request using key ending ...{current_api_key[-4:]} for model {GEMINI_MODEL_NAME}.")
+                # send_telegram_notification(f"Successfully processed request using key ending ...{current_api_key[-4:]} for model {GEMINI_MODEL_NAME}.")
                 return json.loads(response_json)
 
             except HTTPException as e:
