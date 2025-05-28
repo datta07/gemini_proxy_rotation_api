@@ -105,7 +105,7 @@ class GeminiOpenAIWrapper:
         """Extracts system instructions from OpenAI-style messages."""
         system_instructions = []
         for message in messages:
-            if message["role"] == "system"]:
+            if message["role"] == "system":
                 system_instructions.append(types.Part.from_text(text=message["content"]))
         return system_instructions
 
@@ -245,10 +245,10 @@ def decrypt_data(encrypted_data: str) -> dict:
         encrypted_bytes = base64.b64decode(encrypted_data)
         cipher = AES.new(SECRET_KEY_BYTES, AES.MODE_CBC, IV_BYTES)
         decrypted_bytes = unpad(cipher.decrypt(encrypted_bytes), AES.block_size)
-        decrypted_data = json.loads(decrypted_bytes.decode("utf-8"))
+        decrypted_data = json.loads(decrypted_bytes.decode('utf-8'))
         return decrypted_data
     except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Decryption failed: {str(e)}")
+        raise ValueError(f"Decryption failed: {str(e)}")
 
 async def mark_key_rate_limited(api_key: str, error_detail: str):
     """Mark an API key as rate-limited with a cooldown period."""
