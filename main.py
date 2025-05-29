@@ -141,6 +141,10 @@ class GeminiOpenAIWrapper:
         # Gemini usually expects the conversation history in `contents`.
         if not gemini_contents and not system_instructions:
              raise ValueError("No valid user/model messages or system instructions found in payload.")
+
+        print(f"DEBUG: Raw messages payload received: {messages}") # Important to see original input
+        print(f"DEBUG: Converted Gemini Contents: {gemini_contents}")
+        print(f"DEBUG: Extracted System Instructions: {system_instructions}")
         
         try:
             response = await asyncio.to_thread(
