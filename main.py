@@ -26,7 +26,7 @@ class Settings(BaseSettings):
     TELEGRAM_CHAT_ID: str | None = None
     # GEMINI_API_KEYS should be a JSON string like '{"key1_value": "label1", ...}'
     GEMINI_API_KEYS: Dict[str, str]
-    GEMINI_MODEL_NAME: str = "gemini-2.5-pro"
+    GEMINI_MODEL_NAME: str = "gemini-2.5-flash"
     RATE_LIMIT_COOLDOWN_MINUTES: int = 5
 
     class Config:
