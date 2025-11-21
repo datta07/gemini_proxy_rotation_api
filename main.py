@@ -10,7 +10,7 @@ from typing import Any, Dict, List
 import httpx
 from Crypto.Cipher import AES
 from Crypto.Util.Padding import pad, unpad
-from fastapi import BackgroundTasks, Body, Depends, FastAPI, HTTPException
+from fastapi import BackgroundTasks, Body, Depends, FastAPI, HTTPException, Request
 from google.api_core import exceptions
 from google.generativeai import types
 import google.generativeai as genai
@@ -241,10 +241,25 @@ class GeminiService:
 # --- 4. API Endpoint ---
 @app.post("/chat")
 async def chat_proxy(
+    request: Request,
     background_tasks: BackgroundTasks,
     key_manager: APIKeyManager = Depends(get_key_manager),
-    encrypted_data: str = Body(..., embed=True),
 ):
+    content_type = request.headers.get("content-type", "")
+    
+    if "application/json" in content_type:
+        try:
+            data = await request.json()
+            encrypted_data = data.get("encrypted_data")
+        except json.JSONDecodeError:
+             raise HTTPException(status_code=400, detail="Invalid JSON body")
+    else:
+        body = await request.body()
+        encrypted_data = body.decode("utf-8")
+
+    if not encrypted_data:
+        raise HTTPException(status_code=400, detail="Missing encrypted_data in body")
+
     decrypted_messages = decrypt_data(encrypted_data)
     
     max_retries = len(key_manager._key_list)
