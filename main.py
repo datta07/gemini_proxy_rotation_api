@@ -25,7 +25,7 @@ class Settings(BaseSettings):
     # GEMINI_API_KEYS should be a JSON string like '{"key1_value": "label1", ...}'
     GEMINI_API_KEYS: Dict[str, str]
     # Comma-separated list of models, e.g. "gemini-2.5-flash,gemini-2.5-flash-lite"
-    GEMINI_MODEL_NAME: str = "gemini-2.5-flash"
+    GEMINI_MODEL_NAME: str
     RATE_LIMIT_COOLDOWN_MINUTES: int = 60
 
     @property
