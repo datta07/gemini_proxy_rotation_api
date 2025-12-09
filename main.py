@@ -1,11 +1,9 @@
-# main.py
-
 import asyncio
 import base64
 import json
 import os
 from datetime import datetime, timedelta
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Tuple
 
 import httpx
 from Crypto.Cipher import AES
@@ -26,8 +24,13 @@ class Settings(BaseSettings):
     TELEGRAM_CHAT_ID: str | None = None
     # GEMINI_API_KEYS should be a JSON string like '{"key1_value": "label1", ...}'
     GEMINI_API_KEYS: Dict[str, str]
+    # Comma-separated list of models, e.g. "gemini-2.5-flash,gemini-2.5-flash-lite"
     GEMINI_MODEL_NAME: str = "gemini-2.5-flash"
-    RATE_LIMIT_COOLDOWN_MINUTES: int = 5
+    RATE_LIMIT_COOLDOWN_MINUTES: int = 60
+
+    @property
+    def GEMINI_MODELS(self) -> List[str]:
+        return [m.strip() for m in self.GEMINI_MODEL_NAME.split(",") if m.strip()]
 
     class Config:
         env_file = ".env"  # Load from a .env file if present
@@ -50,77 +53,124 @@ gemini_lock = asyncio.Lock()
 
 
 # --- 2. Dependencies ---
-# Manages the state and rotation of Gemini API keys
-class APIKeyManager:
-    def __init__(self, api_keys: Dict[str, str]):
+# Manages the state and rotation of Gemini API keys and Models
+class ResourceManager:
+    def __init__(self, api_keys: Dict[str, str], models: List[str]):
         if not api_keys:
             raise ValueError("GEMINI_API_KEYS cannot be empty.")
+        if not models:
+            raise ValueError("GEMINI_MODELS cannot be empty.")
+        
         self._api_keys = api_keys
         self._key_list = list(api_keys.keys())
-        self._key_state = {
-            key: {"is_rate_limited": False, "cooldown_until": None}
-            for key in self._key_list
-        }
-        self._current_index = 0
+        self._models = models
+        
+        # Track state for each (key, model) pair
+        # Structure: {(key, model): {"is_rate_limited": bool, "cooldown_until": datetime}}
+        self._resource_state: Dict[Tuple[str, str], Dict[str, Any]] = {}
+        
+        # Initialize state
+        for key in self._key_list:
+            for model in self._models:
+                self._resource_state[(key, model)] = {
+                    "is_rate_limited": False, 
+                    "cooldown_until": None
+                }
+
+        self._current_model_index = 0
+        self._current_key_index = 0
         self._lock = asyncio.Lock()
-        print(f"Initialized API key manager with {len(self._key_list)} keys.")
+        print(f"Initialized Resource Manager with {len(self._key_list)} keys and {len(self._models)} models.")
 
-    async def get_next_available_key(self, background_tasks: BackgroundTasks) -> str:
+    async def get_next_available_resource(self, background_tasks: BackgroundTasks) -> Tuple[str, str]:
         async with self._lock:
-            for _ in range(len(self._key_list)):
-                key = self._key_list[self._current_index]
-                state = self._key_state[key]
+            # We iterate through models (priority) and then keys
+            # To ensure fair usage and rotation, we start from the current indices
+            # but we need to loop through ALL possibilities before giving up.
+            
+            total_combinations = len(self._models) * len(self._key_list)
+            
+            # We want to iterate through models as the outer loop (priority)
+            # But we want to persist the rotation state.
+            
+            # Simple strategy:
+            # 1. Try current model with all keys (starting from current key index)
+            # 2. If all keys for current model are exhausted, move to next model.
+            
+            start_model_idx = self._current_model_index
+            
+            for m_offset in range(len(self._models)):
+                model_idx = (start_model_idx + m_offset) % len(self._models)
+                model_name = self._models[model_idx]
+                
+                # For this model, try all keys
+                start_key_idx = self._current_key_index if model_idx == self._current_model_index else 0
+                
+                for k_offset in range(len(self._key_list)):
+                    key_idx = (start_key_idx + k_offset) % len(self._key_list)
+                    key = self._key_list[key_idx]
+                    
+                    state = self._resource_state[(key, model_name)]
+                    
+                    # Check cooldown
+                    if state["is_rate_limited"]:
+                        if datetime.now() > state.get("cooldown_until", datetime.min):
+                            # Cooldown expired
+                            state["is_rate_limited"] = False
+                            state["cooldown_until"] = None
+                            label = self._api_keys.get(key, "Unknown")
+                            print(f"Resource ({label}, {model_name}) cooldown expired.")
+                            background_tasks.add_task(
+                                send_telegram_notification,
+                                f"✅ <b>Restored Resource</b>\n"
+                                f"🔑 Key: <code>...{key[-4:]}</code> ({label})\n"
+                                f"🤖 Model: <code>{model_name}</code>\n"
+                                f"Resource is active again."
+                            )
+                        else:
+                            # Still rate limited, skip
+                            continue
+                    
+                    # Found a valid resource
+                    self._current_model_index = model_idx
+                    self._current_key_index = (key_idx + 1) % len(self._key_list) # Rotate key for next time
+                    return key, model_name
 
-                # Check if the key's cooldown has expired
-                if state["is_rate_limited"] and datetime.now() > state.get(
-                    "cooldown_until", datetime.min
-                ):
-                    state["is_rate_limited"] = False
-                    state["cooldown_until"] = None
-                    label = self._api_keys.get(key, "Unknown")
-                    print(f"Key '{label}' cooldown expired. Resetting.")
-                    background_tasks.add_task(
-                        send_telegram_notification,
-                        f"✅ API Key '{label}' (ending ...{key[-4:]}) cooldown expired and is now active.",
-                    )
-
-                if not state["is_rate_limited"]:
-                    self._current_index = (self._current_index + 1) % len(
-                        self._key_list
-                    )
-                    return key
-
-                self._current_index = (self._current_index + 1) % len(self._key_list)
-
-            # If all keys are rate-limited
+            # If we reach here, EVERYTHING is rate limited
             raise HTTPException(
-                status_code=429, detail="All API keys are currently rate-limited."
+                status_code=429, 
+                detail="All (Key, Model) combinations are currently rate-limited."
             )
 
-    async def mark_key_as_rate_limited(
-        self, key: str, background_tasks: BackgroundTasks
+    async def mark_resource_as_rate_limited(
+        self, key: str, model_name: str, background_tasks: BackgroundTasks
     ):
         async with self._lock:
             cooldown_until = datetime.now() + timedelta(
                 minutes=settings.RATE_LIMIT_COOLDOWN_MINUTES
             )
-            self._key_state[key]["is_rate_limited"] = True
-            self._key_state[key]["cooldown_until"] = cooldown_until
+            self._resource_state[(key, model_name)]["is_rate_limited"] = True
+            self._resource_state[(key, model_name)]["cooldown_until"] = cooldown_until
+            
             label = self._api_keys.get(key, "Unknown")
-            print(f"Key '{label}' marked as rate-limited until {cooldown_until}.")
+            print(f"Resource ({label}, {model_name}) marked as rate-limited until {cooldown_until}.")
+            
             background_tasks.add_task(
                 send_telegram_notification,
-                f"RATE LIMIT: API Key '{label}' (ending ...{key[-4:]}) is now on cooldown.",
+                f"🚨 <b>Rate Limit Alert</b>\n"
+                f"🔑 Key: <code>...{key[-4:]}</code> ({label})\n"
+                f"🤖 Model: <code>{model_name}</code>\n"
+                f"⏳ Cooldown: {settings.RATE_LIMIT_COOLDOWN_MINUTES} mins"
             )
 
 
-# Initialize the key manager as a singleton
-api_key_manager = APIKeyManager(settings.GEMINI_API_KEYS)
+# Initialize the resource manager as a singleton
+resource_manager = ResourceManager(settings.GEMINI_API_KEYS, settings.GEMINI_MODELS)
 
 
-# Dependency to provide the key manager to the endpoint
-def get_key_manager():
-    return api_key_manager
+# Dependency to provide the manager to the endpoint
+def get_resource_manager():
+    return resource_manager
 
 
 # --- 3. Services (Core Logic) ---
@@ -130,7 +180,11 @@ async def send_telegram_notification(message: str):
     if not settings.TELEGRAM_BOT_TOKEN or not settings.TELEGRAM_CHAT_ID:
         return
     url = f"https://api.telegram.org/bot{settings.TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {"chat_id": settings.TELEGRAM_CHAT_ID, "text": message}
+    payload = {
+        "chat_id": settings.TELEGRAM_CHAT_ID, 
+        "text": message,
+        "parse_mode": "HTML"
+    }
     try:
         async with httpx.AsyncClient() as client:
             response = await client.post(url, json=payload)
@@ -158,8 +212,9 @@ def decrypt_data(encrypted_data: str) -> List[Dict[str, str]]:
 
 
 class GeminiService:
-    def __init__(self, api_key: str):
+    def __init__(self, api_key: str, model_name: str):
         self.api_key = api_key
+        self.model_name = model_name
 
     def _prepare_gemini_request(self, messages: List[Dict[str, str]]):
         gemini_contents = []
@@ -205,7 +260,7 @@ class GeminiService:
             async with gemini_lock:
                 genai.configure(api_key=self.api_key)
                 model = genai.GenerativeModel(
-                    model_name=settings.GEMINI_MODEL_NAME,
+                    model_name=self.model_name,
                     system_instruction=system_instructions if system_instructions else None
                 )
                 
@@ -218,7 +273,7 @@ class GeminiService:
                 "id": f"chatcmpl-gemini-{os.urandom(8).hex()}",
                 "object": "chat.completion",
                 "created": int(datetime.now().timestamp()),
-                "model": settings.GEMINI_MODEL_NAME,
+                "model": self.model_name,
                 "choices": [
                     {
                         "index": 0,
@@ -243,7 +298,7 @@ class GeminiService:
 async def chat_proxy(
     request: Request,
     background_tasks: BackgroundTasks,
-    key_manager: APIKeyManager = Depends(get_key_manager),
+    resource_manager: ResourceManager = Depends(get_resource_manager),
 ):
     content_type = request.headers.get("content-type", "")
     
@@ -262,22 +317,29 @@ async def chat_proxy(
 
     decrypted_messages = decrypt_data(encrypted_data)
     
-    max_retries = len(key_manager._key_list)
+    # Retry logic: Try until we run out of options or succeed
+    # The resource manager will raise 429 if ALL options are exhausted.
+    # We can loop a sufficient number of times (e.g., total combinations * 2) to be safe,
+    # or just use a while True with a break, relying on the manager to raise 429.
+    
+    # However, to prevent infinite loops in case of weird state, let's limit retries.
+    max_retries = len(resource_manager._key_list) * len(resource_manager._models) + 5
+    
     for attempt in range(max_retries):
-        api_key = await key_manager.get_next_available_key(background_tasks)
+        api_key, model_name = await resource_manager.get_next_available_resource(background_tasks)
         
         try:
-            gemini_service = GeminiService(api_key=api_key)
+            gemini_service = GeminiService(api_key=api_key, model_name=model_name)
             response = await gemini_service.generate_content(decrypted_messages)
             return response
         
         except HTTPException as e:
             if e.status_code == 429:
-                await key_manager.mark_key_as_rate_limited(api_key, background_tasks)
-                if attempt < max_retries - 1:
-                    continue
+                await resource_manager.mark_resource_as_rate_limited(api_key, model_name, background_tasks)
+                # Continue to next iteration to get a new resource
+                continue
             raise e
             
     raise HTTPException(
-        status_code=503, detail="All API keys are currently unavailable. Please try again later."
+        status_code=503, detail="Unable to process request after multiple attempts."
     )
